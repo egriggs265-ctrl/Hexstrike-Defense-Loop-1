@@ -1,0 +1,192 @@
+mkdir -p ~/hexwatch/{logs,reports,state,ai} && cat > ~/hexwatch/ai_decision_loop.sh <<'EOF'
+#!/usr/bin/env bash
+set -u
+
+BASE="$HOME/hexwatch"
+REP="$BASE/reports"
+LOG="$BASE/logs"
+AI="$BASE/ai"
+STATE="$BASE/state"
+INTERVAL="${1:-60}"
+
+mkdir -p "$REP" "$LOG" "$AI" "$STATE"
+
+MODEL_CANDIDATES=("ollama" "llm" "python3")
+PROMPT_FILE="$AI/decision_prompt.txt"
+INPUT_FILE="$AI/decision_input.txt"
+OUTPUT_FILE="$REP/ai_decision.txt"
+ACTION_LOG="$LOG/ai_actions.log"
+
+log_msg() {
+  echo "[$(date '+%F %T')] $*" | tee -a "$ACTION_LOG" >/dev/null
+}
+
+build_input() {
+  {
+    echo "DATE: $(date '+%F %T')"
+    echo
+    echo "=== HEXSTRIKE STATUS ==="
+    [ -f "$REP/hexstrike_status.txt" ] && sed -n '1,220p' "$REP/hexstrike_status.txt" || echo "missing"
+    echo
+    echo "=== ALERTS ==="
+    [ -f "$REP/alerts.txt" ] && sed -n '1,120p' "$REP/alerts.txt" || echo "missing"
+    echo
+    echo "=== LISTENER DIFF ==="
+    [ -f "$REP/listener_diff.txt" ] && sed -n '1,160p' "$REP/listener_diff.txt" || echo "missing"
+    echo
+    echo "=== TOOL STATUS ==="
+    [ -f "$REP/tool_status.txt" ] && sed -n '1,120p' "$REP/tool_status.txt" || echo "missing"
+    echo
+    echo "=== SYSTEM STATUS ==="
+    [ -f "$REP/system_status.txt" ] && sed -n '1,160p' "$REP/system_status.txt" || echo "missing"
+  } > "$INPUT_FILE"
+}
+
+build_prompt() {
+  cat > "$PROMPT_FILE" <<'PROMPT'
+You are a local cybersecurity decision assistant for a single host.
+Your role is DEFENSIVE ONLY.
+
+Goals:
+1. Summarize the host state.
+2. Identify the top 3 risks.
+3. Recommend only SAFE, DEFENSIVE actions.
+4. Never recommend exploitation, persistence, credential attacks, scanning third-party targets, malware, or offensive actions.
+5. If a service is exposed on 0.0.0.0, recommend containment steps.
+6. If tools are missing or mismatched, recommend path/wrapper/package fixes.
+7. If listeners changed, explain whether they look normal or worth watching.
+8. Keep the answer structured and short.
+
+Output format exactly:
+
+RISK_LEVEL: <low|medium|high>
+SUMMARY:
+- ...
+TOP_RISKS:
+- ...
+RECOMMENDED_ACTIONS:
+- ...
+SAFE_AUTO_ACTIONS:
+- ...
+PROMPT
+}
+
+run_ai_with_ollama() {
+  command -v ollama >/dev/null 2>&1 || return 1
+  local model
+  model="$(ollama list 2>/dev/null | awk 'NR==2{print $1}')"
+  [ -n "${model:-}" ] || return 1
+  cat "$PROMPT_FILE" "$INPUT_FILE" | ollama run "$model" > "$OUTPUT_FILE" 2>/dev/null
+}
+
+run_ai_with_python_rules() {
+  python3 - <<'PY' > "$OUTPUT_FILE"
+from pathlib import Path
+import re
+
+base = Path.home() / "hexwatch"
+rep = base / "reports"
+text = (base / "ai" / "decision_input.txt").read_text(errors="ignore")
+
+risk = "low"
+summary = []
+risks = []
+actions = []
+safe_auto = []
+
+if "0.0.0.0:8888" in text:
+    risk = "high"
+    summary.append("HexStrike API is exposed on all interfaces on tcp/8888.")
+    risks.append("Remote access to the local AI service from the LAN may be possible.")
+    actions.append("Restrict tcp/8888 to localhost or firewall it from non-local sources.")
+    safe_auto.append("Add a local firewall rule for tcp/8888 or relaunch the service with localhost binding.")
+
+if '"status":"healthy"' in text or "status\":\"healthy" in text:
+    summary.append("HexStrike health endpoint is responding.")
+else:
+    risk = "medium" if risk == "low" else risk
+    risks.append("HexStrike health endpoint may be unavailable.")
+    actions.append("Restart the local service and verify /health.")
+
+if "theharvester\":true" in text.lower() or "theHarvester    ->" in text:
+    summary.append("theHarvester is available to the host/toolchain.")
+if "shodan-cli\":true" in text.lower():
+    summary.append("CLI wrapper visibility improved for shodan-cli.")
+
+listener_block = re.search(r"---- added listeners ----(.*?)---- removed listeners ----", text, re.S)
+if listener_block:
+    added = listener_block.group(1)
+    if "firefox" in added.lower():
+        summary.append("Recent new listeners appear tied to firefox traffic.")
+    elif added.strip():
+        risk = "medium" if risk == "low" else risk
+        risks.append("New listening sockets were detected and should be reviewed.")
+        actions.append("Validate new listeners against expected applications.")
+
+if "Missing" in text and "tool" in text.lower():
+    risk = "medium" if risk == "low" else risk
+    risks.append("Some tool visibility or wrapper mismatches may still exist.")
+    actions.append("Normalize PATH and wrapper names for tools expected by HexStrike.")
+
+if not risks:
+    risks.append("No urgent defensive issue was inferred from the current reports.")
+if not actions:
+    actions.append("Continue monitoring and review new listener diffs.")
+if not safe_auto:
+    safe_auto.append("Refresh reports and keep the defense loop running.")
+
+print(f"RISK_LEVEL: {risk}")
+print("SUMMARY:")
+for x in summary[:5] or ["Host appears stable with no immediate critical fault inferred."]:
+    print(f"- {x}")
+print("TOP_RISKS:")
+for x in risks[:3]:
+    print(f"- {x}")
+print("RECOMMENDED_ACTIONS:")
+for x in actions[:5]:
+    print(f"- {x}")
+print("SAFE_AUTO_ACTIONS:")
+for x in safe_auto[:5]:
+    print(f"- {x}")
+PY
+}
+
+apply_safe_actions() {
+  grep -qi 'tcp/8888' "$OUTPUT_FILE" || return 0
+
+  if command -v sudo >/dev/null 2>&1; then
+    sudo iptables -C INPUT -p tcp --dport 8888 ! -s 127.0.0.1 -j DROP >/dev/null 2>&1 || \
+    sudo iptables -I INPUT -p tcp --dport 8888 ! -s 127.0.0.1 -j DROP >/dev/null 2>&1
+    log_msg "Applied defensive firewall rule to restrict external access to tcp/8888"
+  fi
+}
+
+render() {
+  clear
+  echo "==================== HEXWATCH AI DECISION LOOP ===================="
+  date
+  echo
+  [ -f "$REP/alerts.txt" ] && sed -n '1,40p' "$REP/alerts.txt"
+  echo
+  sed -n '1,120p' "$OUTPUT_FILE"
+  echo
+  echo "Input:  $INPUT_FILE"
+  echo "Prompt: $PROMPT_FILE"
+  echo "Log:    $ACTION_LOG"
+  echo "Interval: ${INTERVAL}s"
+}
+
+while true; do
+  build_input
+  build_prompt
+
+  if ! run_ai_with_ollama; then
+    run_ai_with_python_rules
+  fi
+
+  apply_safe_actions
+  render
+  sleep "$INTERVAL"
+done
+EOF
+chmod +x ~/hexwatch/ai_decision_loop.sh && ~/hexwatch/ai_decision_loop.sh 60
