@@ -1,172 +1,497 @@
-mkdir -p ~/hexwatch/{logs,reports,state} && cat > ~/hexwatch/defense_loop.sh <<'EOF'
+cat > ~/hexwatch/hexwatch_pro.sh <<'EOF'
 #!/usr/bin/env bash
 set -u
-STATE_DIR="$HOME/hexwatch/state"
-LOG_DIR="$HOME/hexwatch/logs"
-REP_DIR="$HOME/hexwatch/reports"
-INTERVAL="${1:-30}"
-PATH="/usr/sbin:/usr/bin:/sbin:/bin:$HOME/go/bin:$HOME/.local/bin:$PATH"
 
-mkdir -p "$STATE_DIR" "$LOG_DIR" "$REP_DIR"
+ROOT="$HOME/hexwatch"
+STATE="$ROOT/state"
+LOGS="$ROOT/logs"
+REPORTS="$ROOT/reports"
+ARCHIVE="$ROOT/archive"
+INTERVAL="${1:-60}"
+CIDR_IN="${2:-auto}"
 
-snapshot_listeners() {
-  ss -ltnup 2>/dev/null | sed 's/[[:space:]]\+/ /g' | sort
+PATH="/usr/sbin:/usr/bin:/sbin:/bin:$HOME/.local/bin:$HOME/go/bin:$PATH"
+
+mkdir -p "$STATE" "$LOGS" "$REPORTS" "$ARCHIVE"
+
+LOCK="$STATE/hexwatch_pro.lock"
+exec 9>"$LOCK"
+flock -n 9 || { echo "[!] Hexwatch Pro already running."; exit 1; }
+
+ts(){ date '+%F %T'; }
+stamp(){ date '+%Y%m%d_%H%M%S'; }
+
+detect_cidr() {
+  ip -o -f inet addr show scope global 2>/dev/null |
+    awk '{print $4}' |
+    grep -Ev '^127\.|^169\.254\.' |
+    head -n1
 }
 
-snapshot_processes() {
-  ps -eo pid,ppid,user,%cpu,%mem,etime,comm,args --sort=-%cpu | head -n 40
+allow_cidr() {
+  case "$1" in
+    10.*/*|192.168.*/*|172.16.*/*|172.17.*/*|172.18.*/*|172.19.*/*|172.2[0-9].*/*|172.3[0-1].*/*) echo "$1" ;;
+    *) echo "" ;;
+  esac
 }
 
-snapshot_hexstrike() {
+CIDR="$CIDR_IN"
+[ "$CIDR" = "auto" ] && CIDR="$(detect_cidr)"
+CIDR="$(allow_cidr "$CIDR")"
+
+normalize_hosts() {
+  awk '
+    {
+      gsub(/[()]/,"",$1)
+      ip=$1
+      mac=$2
+      state=$3
+      if (ip ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) {
+        if (mac == "" || mac == "NO_MAC") mac="NO_MAC"
+        if (state == "") state="seen"
+        key=ip
+        if (!(key in best) || mac!="NO_MAC") best[key]=ip" "tolower(mac)" "state
+      }
+    }
+    END { for (k in best) print best[k] }
+  ' | sort -V
+}
+
+rotate() {
+  find "$LOGS" "$REPORTS" -type f -size +8M -exec sh -c 'mv "$1" "$1.$(date +%Y%m%d_%H%M%S).bak"' _ {} \; 2>/dev/null || true
+  find "$ARCHIVE" -type f -mtime +21 -delete 2>/dev/null || true
+}
+
+snapshot_identity() {
   {
-    echo "==== $(date '+%F %T') HEXSTRIKE HEALTH ===="
-    curl -fsS http://127.0.0.1:8888/health 2>/dev/null || echo "health: unavailable"
+    echo "# Identity"
     echo
-    echo "==== VERSION ===="
-    curl -fsS http://127.0.0.1:8888/version 2>/dev/null || echo "version: unavailable"
+    echo "**Time:** $(ts)"
+    echo "**Host:** $(hostname 2>/dev/null || echo unknown)"
+    echo "**User:** $(id -un 2>/dev/null || echo unknown)"
+    echo "**Kernel:** $(uname -a 2>/dev/null || echo unknown)"
+    echo "**CIDR:** ${CIDR:-none}"
     echo
-    echo "==== PORT 8888 ===="
-    ss -ltnp 2>/dev/null | grep ':8888 ' || echo "8888 not listening"
+    echo "## Interfaces"
+    ip -br addr 2>/dev/null || true
     echo
-    echo "==== HEXSTRIKE PROCESSES ===="
-    pgrep -af 'hexstrike|theHarvester|amass|paramspider|httpx|python3' || true
-  } > "$REP_DIR/hexstrike_status.txt"
+    echo "## Routes"
+    ip route 2>/dev/null || true
+  } > "$REPORTS/identity.md"
 }
 
 snapshot_system() {
   {
-    echo "==== $(date '+%F %T') SYSTEM SNAPSHOT ===="
+    echo "# System"
     echo
-    echo "---- uptime ----"
-    uptime
+    echo "**Time:** $(ts)"
+    uptime || true
     echo
-    echo "---- memory ----"
-    free -h
+    free -h || true
     echo
-    echo "---- disk ----"
-    df -h /
+    df -h / "$HOME" 2>/dev/null || df -h / || true
     echo
-    echo "---- top cpu ----"
-    ps -eo pid,user,%cpu,%mem,comm,args --sort=-%cpu | head -n 20
+    echo "## Top CPU"
+    ps -eo pid,ppid,user,%cpu,%mem,etime,comm,args --sort=-%cpu | head -n 25 || true
     echo
-    echo "---- top memory ----"
-    ps -eo pid,user,%cpu,%mem,comm,args --sort=-%mem | head -n 20
-  } > "$REP_DIR/system_status.txt"
+    echo "## Top Memory"
+    ps -eo pid,ppid,user,%cpu,%mem,etime,comm,args --sort=-%mem | head -n 25 || true
+  } > "$REPORTS/system.md"
 }
 
 snapshot_tools() {
   {
-    echo "==== $(date '+%F %T') TOOL VISIBILITY ===="
-    for t in hexstrike_server airmon-ng airodump-ng aireplay-ng aircrack-ng amass steghide testdisk shodan checkov uro anew qsreplace theHarvester paramspider curl ss ps tee; do
-      printf '%-15s -> ' "$t"
+    echo "# Tool Visibility"
+    echo
+    echo "**Time:** $(ts)"
+    for t in nmap msfconsole msfdb curl ss ip arp awk sed jq python3 git journalctl systemctl pgrep flock timeout; do
+      printf '%-18s -> ' "$t"
       command -v "$t" || echo "missing"
     done
-  } > "$REP_DIR/tool_status.txt"
+  } > "$REPORTS/tools.md"
+}
+
+snapshot_processes() {
+  ps -eo pid,ppid,user,%cpu,%mem,etime,comm,args --sort=pid 2>/dev/null |
+    sed 's/[[:space:]]\+/ /g' |
+    sort > "$STATE/processes.curr"
+
+  {
+    echo "# Process Diff"
+    echo
+    echo "**Time:** $(ts)"
+    if [ -f "$STATE/processes.prev" ]; then
+      echo "## New Processes"
+      comm -13 "$STATE/processes.prev" "$STATE/processes.curr" | head -n 80 || true
+      echo
+      echo "## Ended Processes"
+      comm -23 "$STATE/processes.prev" "$STATE/processes.curr" | head -n 80 || true
+    else
+      echo "Baseline created."
+    fi
+  } > "$REPORTS/processes.md"
+
+  cp "$STATE/processes.curr" "$STATE/processes.prev"
+}
+
+snapshot_listeners() {
+  ss -ltnup 2>/dev/null |
+    sed 's/[[:space:]]\+/ /g' |
+    sort > "$STATE/listeners.curr"
+
+  {
+    echo "# Listener Diff"
+    echo
+    echo "**Time:** $(ts)"
+    echo
+    echo "## Current Listening Ports"
+    cat "$STATE/listeners.curr" || true
+    echo
+    if [ -f "$STATE/listeners.prev" ]; then
+      echo "## Added"
+      comm -13 "$STATE/listeners.prev" "$STATE/listeners.curr" || true
+      echo
+      echo "## Removed"
+      comm -23 "$STATE/listeners.prev" "$STATE/listeners.curr" || true
+    else
+      echo "Baseline created."
+    fi
+  } > "$REPORTS/listeners.md"
+
+  cp "$STATE/listeners.curr" "$STATE/listeners.prev"
+}
+
+snapshot_hexstrike() {
+  {
+    echo "# HexStrike"
+    echo
+    echo "**Time:** $(ts)"
+    echo
+    echo "## Health"
+    curl -fsS --max-time 2 http://127.0.0.1:8888/health 2>/dev/null || echo "health: unavailable"
+    echo
+    echo "## Version"
+    curl -fsS --max-time 2 http://127.0.0.1:8888/version 2>/dev/null || echo "version: unavailable"
+    echo
+    echo "## Listener"
+    ss -ltnp 2>/dev/null | grep ':8888 ' || echo "8888 not listening"
+    echo
+    echo "## Related Processes"
+    pgrep -af 'hexstrike|theHarvester|amass|paramspider|httpx|subfinder|nuclei|python3' || true
+  } > "$REPORTS/hexstrike.md"
 }
 
 snapshot_journal() {
   {
-    echo "==== $(date '+%F %T') RECENT AUTH FAILURES ===="
-    journalctl -n 200 --no-pager 2>/dev/null | grep -Ei 'failed password|authentication failure|invalid user|sudo:' | tail -n 50 || true
+    echo "# Journal Signals"
     echo
-    echo "==== RECENT NETWORK/HTTP 8888 HITS ===="
-    journalctl -n 300 --no-pager 2>/dev/null | grep -E '127\.0\.0\.1|192\.168\.|:8888|GET /health|GET /version' | tail -n 50 || true
-  } > "$REP_DIR/journal_status.txt"
+    echo "**Time:** $(ts)"
+    journalctl -n 500 --no-pager 2>/dev/null |
+      grep -Ei 'failed password|authentication failure|invalid user|sudo:|segfault|oom|denied|blocked|apparmor|audit|ufw|firewall|error|panic' |
+      tail -n 120 || true
+  } > "$REPORTS/journal.md"
 }
 
-alert_checks() {
-  local alerts=0
-  : > "$REP_DIR/alerts.txt"
+network_inventory() {
+  [ -n "$CIDR" ] || {
+    echo "# Network Inventory" > "$REPORTS/network.md"
+    echo "No safe private CIDR detected." >> "$REPORTS/network.md"
+    return
+  }
 
-  if ss -ltn 2>/dev/null | grep -q '0.0.0.0:8888'; then
-    echo "[ALERT] HexStrike API is exposed on 0.0.0.0:8888" >> "$REP_DIR/alerts.txt"
-    alerts=1
-  fi
-
-  if ! curl -fsS http://127.0.0.1:8888/health >/dev/null 2>&1; then
-    echo "[ALERT] HexStrike health endpoint is not responding on 127.0.0.1:8888" >> "$REP_DIR/alerts.txt"
-    alerts=1
-  fi
-
-  if command -v airmon-ng >/dev/null 2>&1 && ! command -v airodump-ng >/dev/null 2>&1; then
-    echo "[ALERT] Partial wireless toolchain detected" >> "$REP_DIR/alerts.txt"
-    alerts=1
-  fi
-
-  if [ ! -x "$HOME/.local/bin/theHarvester" ] && [ ! -x "$HOME/.local/share/pipx/venvs/theharvester/bin/theHarvester" ]; then
-    echo "[ALERT] theHarvester not executable from expected user paths" >> "$REP_DIR/alerts.txt"
-    alerts=1
-  fi
-
-  return $alerts
-}
-
-diff_listeners() {
-  local curr="$STATE_DIR/listeners.curr"
-  local prev="$STATE_DIR/listeners.prev"
-  snapshot_listeners > "$curr"
-
-  if [ -f "$prev" ]; then
-    {
-      echo "==== $(date '+%F %T') LISTENER DIFF ===="
-      echo
-      echo "---- added listeners ----"
-      comm -13 "$prev" "$curr" || true
-      echo
-      echo "---- removed listeners ----"
-      comm -23 "$prev" "$curr" || true
-    } > "$REP_DIR/listener_diff.txt"
+  if command -v nmap >/dev/null 2>&1; then
+    timeout 90 nmap -sn "$CIDR" -oN "$STATE/nmap_ping.txt" >/dev/null 2>&1 || true
   else
-    {
-      echo "==== $(date '+%F %T') LISTENER DIFF ===="
-      echo "Baseline created."
-    } > "$REP_DIR/listener_diff.txt"
+    : > "$STATE/nmap_ping.txt"
   fi
-
-  cp "$curr" "$prev"
-}
-
-render_dashboard() {
-  clear
-  echo "==================== HEXWATCH DEFENSE LOOP ===================="
-  date
-  echo
-  [ -s "$REP_DIR/alerts.txt" ] && cat "$REP_DIR/alerts.txt" || echo "[OK] No active alerts"
-  echo
-  echo "---- HexStrike status ----"
-  sed -n '1,40p' "$REP_DIR/hexstrike_status.txt"
-  echo
-  echo "---- Listener diff ----"
-  sed -n '1,40p' "$REP_DIR/listener_diff.txt"
-  echo
-  echo "---- Tool status ----"
-  sed -n '1,30p' "$REP_DIR/tool_status.txt"
-  echo
-  echo "Reports: $REP_DIR"
-  echo "Logs:    $LOG_DIR"
-  echo "Interval: ${INTERVAL}s"
-}
-
-while true; do
-  snapshot_hexstrike
-  snapshot_system
-  snapshot_tools
-  snapshot_journal
-  diff_listeners
-  alert_checks || true
 
   {
-    echo "===== $(date '+%F %T') ====="
-    [ -s "$REP_DIR/alerts.txt" ] && cat "$REP_DIR/alerts.txt" || echo "[OK] No active alerts"
-    echo
-    sed -n '1,25p' "$REP_DIR/hexstrike_status.txt"
-    echo
-    sed -n '1,20p' "$REP_DIR/listener_diff.txt"
-    echo
-  } >> "$LOG_DIR/defense_loop.log"
+    ip neigh 2>/dev/null | awk '/lladdr/ {print $1, $5, $6}'
+    awk '/Nmap scan report for/ {gsub(/[()]/,"",$NF); print $NF, "NO_MAC", "nmap"}' "$STATE/nmap_ping.txt"
+  } | normalize_hosts > "$STATE/hosts.curr"
 
-  render_dashboard
+  {
+    echo "# Network Inventory"
+    echo
+    echo "**Time:** $(ts)"
+    echo "**CIDR:** $CIDR"
+    echo
+    echo "## Current Hosts"
+    cat "$STATE/hosts.curr" || true
+    echo
+    if [ -f "$STATE/hosts.prev" ]; then
+      echo "## New Hosts"
+      comm -13 "$STATE/hosts.prev" "$STATE/hosts.curr" || true
+      echo
+      echo "## Missing Hosts"
+      comm -23 "$STATE/hosts.prev" "$STATE/hosts.curr" || true
+    else
+      echo "Baseline created."
+    fi
+  } > "$REPORTS/network.md"
+
+  cp "$STATE/hosts.curr" "$STATE/hosts.prev"
+}
+
+service_inventory() {
+  [ -n "$CIDR" ] || return
+  command -v nmap >/dev/null 2>&1 || return
+
+  timeout 180 nmap -sS -sV --top-ports 100 -T3 -Pn "$CIDR" -oN "$STATE/nmap_services.txt" >/dev/null 2>&1 || true
+
+  awk '
+    /Nmap scan report for/ {host=$NF; gsub(/[()]/,"",host)}
+    /^[0-9]+\/tcp/ {print host, $1, $2, $3, $4, $5, $6, $7, $8}
+  ' "$STATE/nmap_services.txt" |
+    sed 's/[[:space:]]\+/ /g' |
+    sort -V > "$STATE/services.curr"
+
+  {
+    echo "# Service Inventory"
+    echo
+    echo "**Time:** $(ts)"
+    echo "**CIDR:** $CIDR"
+    echo
+    echo "## Current Services"
+    cat "$STATE/services.curr" || true
+    echo
+    if [ -f "$STATE/services.prev" ]; then
+      echo "## New Services"
+      comm -13 "$STATE/services.prev" "$STATE/services.curr" || true
+      echo
+      echo "## Removed Services"
+      comm -23 "$STATE/services.prev" "$STATE/services.curr" || true
+    else
+      echo "Baseline created."
+    fi
+  } > "$REPORTS/services.md"
+
+  cp "$STATE/services.curr" "$STATE/services.prev"
+}
+
+label_assets() {
+  {
+    echo "# Asset Labels"
+    echo
+    echo "**Time:** $(ts)"
+    echo
+    awk '
+      $1=="192.168.1.1" {print "[ROUTER] "$0}
+      $1=="192.168.1.164" {print "[ROKU] "$0}
+      $1=="192.168.1.98" {print "[THIS_HOST] "$0}
+      $1=="192.168.1.37" {print "[UNKNOWN_NEW] "$0}
+    ' "$STATE/hosts.curr" 2>/dev/null || true
+  } > "$REPORTS/assets.md"
+}
+
+metasploit_import() {
+  command -v msfconsole >/dev/null 2>&1 || return
+  [ -s "$STATE/nmap_services.txt" ] || return
+
+  cat > "$STATE/msf_import.rc" <<RC
+workspace -a hexwatch
+workspace hexwatch
+db_import $STATE/nmap_services.txt
+hosts
+services
+exit -y
+RC
+
+  timeout 90 msfconsole -q -r "$STATE/msf_import.rc" > "$REPORTS/metasploit_import.txt" 2>&1 || true
+}
+
+risk_score() {
+  local score=0
+  local f="$STATE/services.curr"
+
+  [ -s "$f" ] || {
+    echo 0 > "$STATE/risk.score"
+    echo "# Risk Score
+
+**Time:** $(ts)
+**Score:** 0/100
+
+No service surface detected by current scan." > "$REPORTS/risk.md"
+    return
+  }
+
+  grep -Eiq '23/tcp|telnet' "$f" && score=$((score+25))
+  grep -Eiq '21/tcp|ftp' "$f" && score=$((score+15))
+  grep -Eiq '22/tcp|ssh' "$f" && score=$((score+5))
+  grep -Eiq '80/tcp|http ' "$f" && score=$((score+5))
+  grep -Eiq '443/tcp|https|ssl/http' "$f" && score=$((score+5))
+  grep -Eiq 'upnp|49152/tcp|49153/tcp|49154/tcp' "$f" && score=$((score+20))
+  grep -Eiq '445/tcp|139/tcp|smb|microsoft-ds' "$f" && score=$((score+20))
+  grep -Eiq '5432/tcp|postgresql' "$f" && score=$((score+10))
+  grep -Eiq '7000/tcp|rtsp|airtunes' "$f" && score=$((score+5))
+
+  [ "$score" -gt 100 ] && score=100
+  echo "$score" > "$STATE/risk.score"
+
+  {
+    echo "# Risk Score"
+    echo
+    echo "**Time:** $(ts)"
+    echo "**Score:** $score/100"
+    echo
+    echo "## Interpretation"
+    if [ "$score" -lt 20 ]; then
+      echo "Low observable LAN surface."
+    elif [ "$score" -lt 50 ]; then
+      echo "Moderate observable LAN surface."
+    else
+      echo "Elevated LAN surface. Review exposed services."
+    fi
+  } > "$REPORTS/risk.md"
+}
+
+alerts() {
+  : > "$REPORTS/alerts.txt"
+
+  if ss -ltn 2>/dev/null | grep -q '0.0.0.0:8888'; then
+    echo "[ALERT] HexStrike API exposed on 0.0.0.0:8888" >> "$REPORTS/alerts.txt"
+  elif ss -ltn 2>/dev/null | grep -q ':8888 '; then
+    curl -fsS --max-time 2 http://127.0.0.1:8888/health >/dev/null 2>&1 ||
+      echo "[WARN] Port 8888 listening but HexStrike health failed" >> "$REPORTS/alerts.txt"
+  else
+    echo "[INFO] HexStrike API offline/not started" >> "$REPORTS/alerts.txt"
+  fi
+
+  grep -Eiq 'failed password|authentication failure|invalid user' "$REPORTS/journal.md" 2>/dev/null &&
+    echo "[WARN] Recent auth failure signal found" >> "$REPORTS/alerts.txt"
+
+  grep -Eiq 'telnet|23/tcp' "$STATE/services.curr" 2>/dev/null &&
+    echo "[ALERT] Telnet service observed on LAN" >> "$REPORTS/alerts.txt"
+
+  grep -Eiq 'upnp|49152/tcp|49153/tcp|49154/tcp' "$STATE/services.curr" 2>/dev/null &&
+    echo "[NOTICE] UPnP service observed on LAN/router" >> "$REPORTS/alerts.txt"
+
+  grep -A30 '^## New Hosts' "$REPORTS/network.md" 2>/dev/null |
+    tail -n +2 |
+    grep -Eq '^[0-9]+\.' &&
+    echo "[NOTICE] New LAN host detected" >> "$REPORTS/alerts.txt"
+
+  grep -A50 '^## New Services' "$REPORTS/services.md" 2>/dev/null |
+    tail -n +2 |
+    grep -Eq '[0-9]+/tcp' &&
+    echo "[NOTICE] New LAN service detected" >> "$REPORTS/alerts.txt"
+
+  local score
+  score="$(cat "$STATE/risk.score" 2>/dev/null || echo 0)"
+  [ "$score" -ge 50 ] && echo "[WARN] LAN risk score elevated: $score/100" >> "$REPORTS/alerts.txt"
+
+  [ -s "$REPORTS/alerts.txt" ] || echo "[OK] No active alerts" > "$REPORTS/alerts.txt"
+}
+
+render_json() {
+  python3 - "$REPORTS" "$STATE" "$CIDR" <<'PY'
+import json, pathlib, sys, time
+reports = pathlib.Path(sys.argv[1])
+state = pathlib.Path(sys.argv[2])
+cidr = sys.argv[3]
+
+def lines(path):
+    p = pathlib.Path(path)
+    return p.read_text(errors="replace").splitlines() if p.exists() else []
+
+try:
+    risk = int((state / "risk.score").read_text().strip())
+except Exception:
+    risk = 0
+
+out = {
+    "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+    "cidr": cidr,
+    "risk_score": risk,
+    "alerts": lines(reports / "alerts.txt"),
+    "hosts": lines(state / "hosts.curr"),
+    "services": lines(state / "services.curr"),
+    "reports": {
+        "identity": str(reports / "identity.md"),
+        "system": str(reports / "system.md"),
+        "network": str(reports / "network.md"),
+        "services": str(reports / "services.md"),
+        "listeners": str(reports / "listeners.md"),
+        "processes": str(reports / "processes.md"),
+        "hexstrike": str(reports / "hexstrike.md"),
+        "risk": str(reports / "risk.md"),
+        "alerts": str(reports / "alerts.txt"),
+    },
+}
+(reports / "status.json").write_text(json.dumps(out, indent=2))
+PY
+}
+
+archive_cycle() {
+  tar -czf "$ARCHIVE/reports_$(stamp).tgz" -C "$ROOT" reports state 2>/dev/null || true
+}
+
+dashboard() {
+  clear
+  echo "==================== HEXWATCH PRO DEFENSE SENSOR ===================="
+  echo "Time:      $(ts)"
+  echo "CIDR:      ${CIDR:-none}"
+  echo "Interval:  ${INTERVAL}s"
+  echo "Risk:      $(cat "$STATE/risk.score" 2>/dev/null || echo 0)/100"
+  echo
+  echo "---- Alerts ----"
+  cat "$REPORTS/alerts.txt" 2>/dev/null || true
+  echo
+  echo "---- Assets ----"
+  sed -n '1,30p' "$REPORTS/assets.md" 2>/dev/null || true
+  echo
+  echo "---- Network ----"
+  sed -n '1,45p' "$REPORTS/network.md" 2>/dev/null || true
+  echo
+  echo "---- Services ----"
+  sed -n '1,45p' "$REPORTS/services.md" 2>/dev/null || true
+  echo
+  echo "---- Listeners ----"
+  sed -n '1,35p' "$REPORTS/listeners.md" 2>/dev/null || true
+  echo
+  echo "Reports: $REPORTS"
+  echo "Logs:    $LOGS/hexwatch_pro.log"
+}
+
+rm -f "$STATE/hosts.prev" "$STATE/services.prev" "$STATE/listeners.prev" "$STATE/processes.prev"
+
+cycle=0
+while true; do
+  rotate
+  snapshot_identity
+  snapshot_system
+  snapshot_tools
+  snapshot_processes
+  snapshot_listeners
+  snapshot_hexstrike
+  snapshot_journal
+  network_inventory
+  service_inventory
+  label_assets
+  metasploit_import
+  risk_score
+  alerts
+  render_json
+
+  {
+    echo "===== $(ts) ====="
+    cat "$REPORTS/alerts.txt"
+    echo
+    cat "$REPORTS/risk.md"
+    echo
+    sed -n '1,60p' "$REPORTS/network.md"
+    echo
+    sed -n '1,60p' "$REPORTS/services.md"
+    echo
+  } >> "$LOGS/hexwatch_pro.log"
+
+  cycle=$((cycle+1))
+  [ $((cycle % 10)) -eq 0 ] && archive_cycle
+
+  dashboard
   sleep "$INTERVAL"
 done
 EOF
-chmod +x ~/hexwatch/defense_loop.sh && ~/hexwatch/defense_loop.sh 30
+
+chmod +x ~/hexwatch/hexwatch_pro.sh
+~/hexwatch/hexwatch_pro.sh 60 auto
